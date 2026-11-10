@@ -1,0 +1,9 @@
+# ArUco 정사영 보정 프로그램에 필요한 패키지 (Python 3.11 / 3.12)
+#   py -3 -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+# opencv-python 과 opencv-contrib-python 을 같이 설치하면 충돌하므로 contrib 하나만 설치한다 (aruco 모듈 포함).
+opencv-contrib-python>=4.7
+numpy>=1.24
+pillow>=10.0
+# HEIC 사진을 읽을 때만 필요 (없어도 JPG·PNG 는 동작한다)
+pillow-heif>=0.16

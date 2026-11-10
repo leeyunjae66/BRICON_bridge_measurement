@@ -1,0 +1,6 @@
+# 정합 모듈에 필요한 패키지 (Python 3.11 / 3.12). 1단계(정사영)와 따로 설치한다.
+#   py -3 -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+# opencv-python 과 opencv-contrib-python 을 같이 설치하면 충돌하므로 하나만 설치한다 (SIFT 는 4.4 부터 기본 포함).
+opencv-contrib-python>=4.7
+numpy>=1.24
