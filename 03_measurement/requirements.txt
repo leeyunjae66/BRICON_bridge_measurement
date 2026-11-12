@@ -1,0 +1,5 @@
+# 측정 화면에 필요한 패키지 (Python 3.11 / 3.12). 화면은 파이썬에 들어 있는 tkinter 를 쓴다.
+#   py -3 -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+numpy>=1.24
+pillow>=10.0

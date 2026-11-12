@@ -6,7 +6,7 @@
 |---|---|---|
 | `01_orthorectification` | 마커 1개로 사진 전체를 정사영 보정 | 구현 |
 | `02_registration` | 정사영 그림 여러 장을 하나의 평면 좌표계로 정합 | 구현 |
-| `03_measurement` | 정합된 그림에서 두 점 사이 거리 측정 | 예정 |
+| `03_measurement` | 그림에서 두 점을 찍어 실제 거리 측정 (화면) | 구현 |
 
 ## 설치 (Windows, Python 3.11 / 3.12)
 
@@ -57,6 +57,28 @@ cd 02_registration
 - `plane_mm_from_pixel`: 정사영 그림 픽셀 → 그 그림의 마커 평면 mm
 - `T_ref_from_image`: 그 그림의 마커 평면 mm → 기준 그림의 마커 평면 mm
 - `ref_mm_from_pixel` = `T_ref_from_image · plane_mm_from_pixel`: 거리 측정에 쓰는 행렬
+
+## 3단계: 두 점 거리 측정
+
+```
+cd 03_measurement
+.venv\Scripts\python main.py                          창을 띄우고 '열기' 로 그림을 고른다
+.venv\Scripts\python main.py --image ..\01_orthorectification\output\사진1\orthorectified.png
+.venv\Scripts\python -m unittest test_measurement -v  검사
+```
+
+화면은 파이썬에 들어 있는 tkinter 를 쓴다 (추가 설치는 Pillow, numpy 뿐).
+
+- 열 수 있는 그림 (같은 폴더의 JSON 에서 좌표 정보를 읽는다. 없으면 축척을 추측하지 않고 열지 않는다)
+  - 1단계 `orthorectified.png` (펴진 그림), `aruco_detected.png` (원본 사진) ← `homography.json`
+  - 2단계 `registered_mosaic.png` (합친 그림) ← `registration.json`
+- 쓰는 법
+  - 마우스 휠: 마우스가 있는 자리를 중심으로 확대·축소
+  - 오른쪽 단추 끌기: 그림 옮기기
+  - 왼쪽 단추: 첫 번째는 시작점, 두 번째는 끝점 → 두 점 사이 길이(mm)가 목록에 추가된다
+  - Esc: 시작점 취소, Delete: 목록에서 고른 측정 지우기, F: 화면에 맞춤
+- 목록의 '예상 오차' 는 마커 모서리를 0.3 픽셀 틀리게 읽었다고 가정했을 때 그 길이가 흔들리는 정도다 (1단계 그림에서만 나온다). 렌즈 왜곡, 바닥 굴곡, 마커 크기 오차는 들어 있지 않으므로 실제 오차는 더 클 수 있다.
+- 원본 사진에서 찍어도 정사영 그림에서 찍은 것과 같은 길이가 나온다. 원본이 더 선명해서 점을 정확히 찍기 좋다.
 
 ## 알아 둘 한계
 
