@@ -1,25 +1,35 @@
 """
 측정 화면 (tkinter).
 
-    열기            : 1단계의 orthorectified.png / aruco_detected.png, 2단계의 registered_mosaic.png
+  사진을 넣고 계산 돌리기
+    사진 추가        : 스마트폰 사진을 왼쪽 목록에 넣는다 (여러 장 가능)
+    정사영           : 목록에서 고른 사진을 1단계 프로그램으로 정사영한다 (고른 것이 없으면 아직 안 한 사진 전부)
+    결합             : 정사영한 사진들을 2단계 프로그램으로 하나로 정합한다 (목록의 위에서부터, 첫 번째가 기준)
+    결과 열기        : 이미 만들어 둔 결과 그림을 바로 연다
+  그림에서 재기
     마우스 휠        : 마우스가 있는 자리를 중심으로 확대·축소
     오른쪽 단추 끌기 : 그림 옮기기 (가운데 단추도 됨)
     왼쪽 단추        : 첫 번째는 시작점, 두 번째는 끝점 → 두 점 사이의 실제 길이(mm)가 목록에 추가된다
     Esc             : 찍어 둔 시작점 취소      Delete : 목록에서 고른 측정 지우기      F : 화면에 맞춤
 
+정사영·결합 단추는 앞 단계의 프로그램을 그대로 실행하고 그 결과 파일을 불러올 뿐이다 (runner.py).
 픽셀을 mm 로 바꾸는 계산은 coords.py, 확대·이동 계산은 viewport.py 가 한다. 이 파일은 화면만 맡는다.
 """
 
 from __future__ import annotations
 
+import json
+import queue
+import threading
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
 
 import coords
+import runner
 from config import Config
 from viewport import Viewport
 
@@ -34,33 +44,78 @@ class Measurement:
     result: dict                          # coords.Mapper.measure() 의 결과
 
 
+@dataclass
+class PhotoItem:
+    iid: str
+    kind: str                             # "photo" = 넣은 사진, "mosaic" = 결합 결과
+    path: Path                            # 원본 사진 (결합 결과면 합친 그림)
+    status: str = "원본"
+    ortho: Path | None = None             # 정사영이 끝났으면 orthorectified.png
+
+
+def short_name(name: str, limit: int = 22) -> str:
+    """긴 파일 이름은 가운데를 줄인다. 이름이 비슷한 사진은 끝부분이 다르므로 끝을 남긴다."""
+    if len(name) <= limit:
+        return name
+    tail = limit - 6
+    return f"{name[:5]}…{name[-tail:]}"
+
+
 class MeasureApp(tk.Tk):
     def __init__(self, cfg: Config | None = None, image_path: str | None = None):
         super().__init__()
         self.cfg = cfg or Config()
         self.title("바닥판 치수 측정")
         self.geometry(self.cfg.window_size)
-        self.minsize(900, 560)
+        self.minsize(1100, 600)
         self.image: Image.Image | None = None
         self.mapper: coords.Mapper | None = None
         self.view = Viewport()
         self.measurements: list[Measurement] = []
+        self.photos: list[PhotoItem] = []
         self.pending: tuple[float, float] | None = None       # 찍어 둔 시작점 (그림 픽셀)
         self.cursor: tuple[float, float] | None = None        # 마우스 위치 (화면)
+        self.quiet = False                                    # True 면 알림 창을 띄우지 않는다 (자동 시험용)
+        self.last_message = ""                                # 마지막 알림 내용
+        self.last_log = ""                                    # 마지막으로 실행한 프로그램이 찍은 글
         self._photo = None                                    # 화면에 그린 그림 (지워지지 않게 붙잡아 둔다)
         self._next_no = 1
+        self._next_item = 1
         self._redraw_job = None
         self._drag = None
         self._fit_scale = 1.0
+        self._busy = False
+        self._showing = False
+        self._action_buttons: list[ttk.Button] = []
         self._build()
+        self._load_settings()
         if image_path:
             self.after(80, lambda: self.open_image(image_path))
 
     # ---------------------------------------------------------------- 화면 짜기
     def _build(self) -> None:
-        bar = ttk.Frame(self, padding=(6, 4))
+        # 첫째 줄: 사진을 넣고 계산을 돌리는 단추
+        work = ttk.Frame(self, padding=(6, 5, 6, 2))
+        work.pack(side="top", fill="x")
+        self._button(work, "사진 추가", self.add_photos)
+        self._button(work, "목록에서 빼기", self.remove_selected_photos)
+        ttk.Separator(work, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(work, text="마커 한 변 (mm)").pack(side="left")
+        self.marker_var = tk.StringVar(value=f"{self.cfg.marker_size_mm:g}")
+        ttk.Entry(work, textvariable=self.marker_var, width=7, justify="right").pack(side="left", padx=(4, 4))
+        self._button(work, "정사영", self.orthorectify)
+        ttk.Separator(work, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(work, text="결합 방식").pack(side="left")
+        self.mode_var = tk.StringVar(value=runner.MODES.get(self.cfg.registration_mode, runner.MODES["marker"]))
+        ttk.Combobox(work, textvariable=self.mode_var, values=list(runner.MODES.values()), state="readonly", width=24).pack(side="left", padx=(4, 4))
+        self._button(work, "결합", self.register)
+        ttk.Separator(work, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(work, text="실행 기록", command=self.show_log).pack(side="left", padx=2)
+
+        # 둘째 줄: 그림 보기와 측정
+        bar = ttk.Frame(self, padding=(6, 2, 6, 4))
         bar.pack(side="top", fill="x")
-        for text, cmd in (("열기", self.ask_open), ("화면 맞춤 (F)", self.fit), ("실제 크기 (1:1)", self.actual_size),
+        for text, cmd in (("결과 열기", self.ask_open), ("화면 맞춤 (F)", self.fit), ("실제 크기 (1:1)", self.actual_size),
                           ("선택 지우기 (Del)", self.delete_selected), ("모두 지우기", self.clear_all)):
             ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=2)
         ttk.Label(bar, text="   왼쪽 단추: 시작점 → 끝점   |   휠: 확대·축소   |   오른쪽 단추 끌기: 이동   |   Esc: 시작점 취소",
@@ -68,11 +123,28 @@ class MeasureApp(tk.Tk):
 
         status = ttk.Frame(self, padding=(6, 2))
         status.pack(side="bottom", fill="x")
-        self.status_var = tk.StringVar(value="'열기' 를 눌러 그림을 고르세요.")
+        self.status_var = tk.StringVar(value="'사진 추가' 로 사진을 넣거나, '결과 열기' 로 만들어 둔 결과를 여세요.")
         self.zoom_var = tk.StringVar(value="")
         ttk.Label(status, textvariable=self.status_var).pack(side="left")
         ttk.Label(status, textvariable=self.zoom_var).pack(side="right")
 
+        # 왼쪽: 사진 목록
+        left = ttk.Frame(self, padding=6, width=self.cfg.photo_panel_width)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+        ttk.Label(left, text="사진 목록", font=("", 10, "bold")).pack(anchor="w")
+        self.photo_tree = ttk.Treeview(left, columns=("name", "status"), show="headings", selectmode="extended")
+        self.photo_tree.heading("name", text="이름")
+        self.photo_tree.heading("status", text="상태")
+        self.photo_tree.column("name", width=self.cfg.photo_panel_width - 100, stretch=True)
+        self.photo_tree.column("status", width=80, anchor="center", stretch=False)
+        self.photo_tree.pack(fill="both", expand=True, pady=(2, 6))
+        self.photo_tree.bind("<<TreeviewSelect>>", lambda e: self._on_photo_select())
+        ttk.Label(left, text="사진을 누르면 가운데에 보입니다. 정사영이 끝난 사진은 펴진 그림이 보이고 치수를 잴 수 있습니다.\n"
+                             "결합은 위에서부터 순서대로, 첫 번째 사진이 기준입니다.",
+                  wraplength=self.cfg.photo_panel_width - 16, justify="left", foreground="#555555").pack(anchor="w")
+
+        # 오른쪽: 그림 정보와 측정 목록
         side = ttk.Frame(self, padding=6, width=self.cfg.side_panel_width)
         side.pack(side="right", fill="y")
         side.pack_propagate(False)
@@ -93,6 +165,7 @@ class MeasureApp(tk.Tk):
         self.notes_var = tk.StringVar(value="-")
         ttk.Label(side, textvariable=self.notes_var, wraplength=self.cfg.side_panel_width - 16, justify="left", foreground="#8a4b00").pack(anchor="w", pady=(2, 0))
 
+        # 가운데: 그림
         self.canvas = tk.Canvas(self, background=self.cfg.background, highlightthickness=0, cursor="crosshair")
         self.canvas.pack(side="left", fill="both", expand=True)
         c = self.canvas
@@ -109,30 +182,328 @@ class MeasureApp(tk.Tk):
         self.bind("<Delete>", lambda e: self.delete_selected())
         self.bind("<Key-f>", lambda e: self.fit())
         self.bind("<Key-F>", lambda e: self.fit())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ---------------------------------------------------------------- 그림 열기
+    def _button(self, parent, text: str, command) -> ttk.Button:
+        """계산이 도는 동안 눌리지 않게 묶어 두는 단추."""
+        b = ttk.Button(parent, text=text, command=command)
+        b.pack(side="left", padx=2)
+        self._action_buttons.append(b)
+        return b
+
+    def _notify(self, title: str, text: str, error: bool = False) -> None:
+        self.last_message = text
+        self.status_var.set(text.splitlines()[0] if text else "")
+        if not self.quiet:
+            (messagebox.showerror if error else messagebox.showinfo)(title, text, parent=self)
+
+    # ---------------------------------------------------------------- 설정 기억하기 (마커 크기, 결합 방식)
+    def _load_settings(self) -> None:
+        try:
+            with open(self.cfg.settings_file, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if float(d.get("marker_size_mm", 0)) > 0:
+                self.marker_var.set(f"{float(d['marker_size_mm']):g}")
+            if d.get("registration_mode") in runner.MODES:
+                self.mode_var.set(runner.MODES[d["registration_mode"]])
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save_settings(self) -> None:
+        try:
+            data = {"marker_size_mm": self.marker_size(), "registration_mode": self.mode()}
+            with open(self.cfg.settings_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except (OSError, ValueError):
+            pass
+
+    def _on_close(self) -> None:
+        self._save_settings()
+        self.destroy()
+
+    def marker_size(self) -> float:
+        """입력 칸의 마커 크기. 숫자가 아니거나 0 이하면 ValueError."""
+        value = float(self.marker_var.get().strip().replace(",", "."))
+        if not value > 0:
+            raise ValueError("0 보다 커야 합니다")
+        return value
+
+    def mode(self) -> str:
+        return next((k for k, v in runner.MODES.items() if v == self.mode_var.get()), "marker")
+
+    # ---------------------------------------------------------------- 사진 목록
+    def add_photos(self, paths: list[str] | None = None) -> None:
+        if paths is None:
+            start = self.cfg.photo_dir
+            paths = filedialog.askopenfilenames(
+                parent=self, title="정사영할 사진 선택 (여러 장 가능)",
+                initialdir=str(start) if Path(start).is_dir() else None,
+                filetypes=[("사진", "*.jpg *.jpeg *.png *.heic *.heif"), ("모든 파일", "*.*")])
+        have = {it.path.resolve() for it in self.photos if it.kind == "photo"}
+        first = None
+        for p in paths or []:
+            path = Path(p)
+            if path.resolve() in have:
+                continue
+            have.add(path.resolve())
+            item = PhotoItem(f"p{self._next_item}", "photo", path)
+            self._next_item += 1
+            # 결합 결과는 늘 목록 맨 아래에 두므로 사진은 그 앞에 넣는다
+            pos = sum(1 for it in self.photos if it.kind == "photo")
+            self.photos.insert(pos, item)
+            self.photo_tree.insert("", pos, iid=item.iid, values=(short_name(path.name), item.status))
+            first = first or item
+        if first is not None:
+            self.photo_tree.selection_set(first.iid)
+            self.photo_tree.see(first.iid)
+
+    def remove_selected_photos(self) -> None:
+        gone = set(self.photo_tree.selection())
+        if not gone:
+            return
+        self.photos = [it for it in self.photos if it.iid not in gone]
+        self.photo_tree.delete(*gone)
+
+    def _item(self, iid: str) -> PhotoItem | None:
+        return next((it for it in self.photos if it.iid == iid), None)
+
+    def _set_status(self, item: PhotoItem, status: str) -> None:
+        item.status = status
+        if self.photo_tree.exists(item.iid):
+            self.photo_tree.set(item.iid, "status", status)
+
+    def _on_photo_select(self) -> None:
+        if self._showing or self._busy:
+            return
+        sel = self.photo_tree.selection()
+        if len(sel) == 1:
+            self.show_item(self._item(sel[0]))
+
+    def show_item(self, item: PhotoItem | None) -> None:
+        """목록의 사진을 가운데에 띄운다. 정사영이 끝났으면 펴진 그림(측정 가능), 아니면 원본 사진(보기만)."""
+        if item is None:
+            return
+        if item.kind == "mosaic":
+            self.open_image(str(item.path), ask_on_error=False)
+        elif item.ortho is not None:
+            self.open_image(str(item.ortho), ask_on_error=False)
+        else:
+            self.show_photo(item.path)
+
+    def show_photo(self, path: Path) -> bool:
+        """정사영하기 전의 사진을 보기만 한다 (좌표 정보가 없으므로 치수는 잴 수 없다)."""
+        p = Path(path)
+        try:
+            if p.suffix.lower() in (".heic", ".heif"):
+                import pillow_heif                       # 설치돼 있을 때만 (없으면 아래에서 알림)
+                pillow_heif.register_heif_opener()
+            with Image.open(p) as im:
+                image = ImageOps.exif_transpose(im).convert("RGB")     # 세워 찍은 사진을 바로 세운다
+        except ImportError:
+            self._notify("사진 보기", f"HEIC 사진은 이 화면에서 미리 볼 수 없습니다 ({p.name}).\n정사영은 그대로 할 수 있습니다.")
+            return False
+        except (OSError, ValueError) as e:
+            self._notify("사진 보기", f"사진을 읽지 못했습니다.\n{p.name}\n\n{e}", error=True)
+            return False
+        self._set_image(image, None)
+        self.title(f"바닥판 치수 측정 - {p.name}")
+        self.info_var.set(f"파일: {p.name}\n종류: 넣은 사진 (정사영 전)\n크기: {image.width} × {image.height} 픽셀")
+        self.notes_var.set("· 아직 정사영하지 않아 치수를 잴 수 없습니다. 마커 크기를 확인하고 '정사영' 을 누르세요.")
+        self.status_var.set("정사영 전의 사진입니다. '정사영' 단추를 누르면 펴진 그림이 뜨고 치수를 잴 수 있습니다.")
+        self.fit()
+        return True
+
+    # ---------------------------------------------------------------- 앞 단계 프로그램 실행
+    def _start(self, title: str, work, done, sync: bool = False) -> None:
+        """work(progress) 를 실행하고 끝나면 done(결과) 를 부른다. 계산하는 동안 화면이 멈추지 않게 따로 돌린다.
+
+        sync=True 면 그 자리에서 끝까지 실행한다 (자동 시험용).
+        """
+        if self._busy:
+            return
+        self._save_settings()
+        self.status_var.set(title)
+        if sync:
+            done(work(self.status_var.set))
+            return
+        self._busy = True
+        for b in self._action_buttons:
+            b.state(["disabled"])
+        self.configure(cursor="watch")
+        q: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                q.put(("done", work(lambda text: q.put(("progress", text)))))
+            except Exception as e:                       # 화면이 '계산 중' 에서 멈춰 있지 않게 어떤 오류든 돌려준다
+                q.put(("error", e))
+
+        def poll():
+            try:
+                while True:
+                    kind, value = q.get_nowait()
+                    if kind == "progress":
+                        self.status_var.set(value)
+                        continue
+                    self._busy = False
+                    for b in self._action_buttons:
+                        b.state(["!disabled"])
+                    self.configure(cursor="")
+                    if kind == "error":
+                        self._notify(title, f"실행 중 문제가 생겼습니다.\n{value}", error=True)
+                    else:
+                        done(value)
+                    return
+            except queue.Empty:
+                self.after(100, poll)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, poll)
+
+    def orthorectify(self, sync: bool = False) -> None:
+        """고른 사진(없으면 아직 안 한 사진 전부)을 1단계 프로그램으로 정사영하고, 결과를 띄운다."""
+        photos = [it for it in self.photos if it.kind == "photo"]
+        if not photos:
+            self._notify("정사영", "먼저 '사진 추가' 로 사진을 넣으세요.")
+            return
+        sel = set(self.photo_tree.selection())
+        targets = [it for it in photos if it.iid in sel] or [it for it in photos if it.ortho is None]
+        if not targets:
+            self._notify("정사영", "정사영할 사진이 없습니다. 다시 하려면 목록에서 사진을 고른 뒤 누르세요.")
+            return
+        try:
+            size = self.marker_size()
+        except ValueError:
+            self._notify("정사영", f"마커 한 변의 길이를 mm 숫자로 넣으세요 (지금 값: '{self.marker_var.get()}').", error=True)
+            return
+        for it in targets:
+            self._set_status(it, "계산 중")
+
+        def work(progress):
+            out = []
+            for k, it in enumerate(targets, 1):
+                progress(f"정사영 계산 중 ({k}/{len(targets)}): {it.path.name}  (마커 {size:g} mm)")
+                try:
+                    out.append((it, runner.run_orthorectification(it.path, size)))
+                except runner.RunnerError as e:
+                    out.append((it, e))
+            return out
+
+        def done(results):
+            logs, failed, last_ok = [], [], None
+            for it, res in results:
+                if isinstance(res, runner.RunResult):
+                    logs.append(f"===== 정사영: {it.path.name} (마커 {size:g} mm)\n{res.output}")
+                    if res.ok:
+                        it.ortho = res.result_image
+                        self._set_status(it, "정사영 완료")
+                        last_ok = it
+                        continue
+                    failed.append((it, res.summary))
+                else:
+                    failed.append((it, str(res)))
+                it.ortho = None
+                self._set_status(it, "실패")
+            self.last_log = "\n\n".join(logs)
+            if last_ok is not None:
+                self._select_item(last_ok)
+                self.show_item(last_ok)
+                self.status_var.set(f"정사영 {len(results) - len(failed)}장 완료. 결과: {last_ok.ortho.parent}")
+            if failed:
+                self._notify("정사영", f"{len(failed)}장을 정사영하지 못했습니다.\n\n" + "\n\n".join(f"[{it.path.name}]\n{why}" for it, why in failed), error=True)
+
+        self._start(f"정사영 계산 중… ({len(targets)}장)", work, done, sync)
+
+    def register(self, sync: bool = False) -> None:
+        """정사영한 사진들을 2단계 프로그램으로 정합하고, 합친 그림을 띄운다."""
+        ready = [it for it in self.photos if it.kind == "photo" and it.ortho is not None]
+        sel = set(self.photo_tree.selection())
+        chosen = [it for it in ready if it.iid in sel]
+        targets = chosen if len(chosen) >= 2 else ready
+        if len(targets) < 2:
+            self._notify("결합", f"결합하려면 정사영한 사진이 2장 이상 필요합니다 (지금 {len(ready)}장).\n사진을 추가하고 '정사영' 을 먼저 누르세요.")
+            return
+        mode = self.mode()
+
+        def work(progress):
+            progress(f"결합 계산 중… ({len(targets)}장, {runner.MODES[mode]})")
+            return runner.run_registration([it.ortho for it in targets], mode)
+
+        def done(res: runner.RunResult):
+            self.last_log = f"===== 결합: {len(targets)}장, {runner.MODES[mode]}\n{res.output}"
+            if not res.ok:
+                self._notify("결합", f"결합하지 못했습니다.\n\n{res.summary}", error=True)
+                return
+            for it in [x for x in self.photos if x.kind == "mosaic"]:       # 결합 결과는 하나만 둔다
+                self.photos.remove(it)
+                self.photo_tree.delete(it.iid)
+            item = PhotoItem(f"m{self._next_item}", "mosaic", res.result_image, "결합 완료")
+            self._next_item += 1
+            self.photos.append(item)
+            self.photo_tree.insert("", "end", iid=item.iid, values=(f"[결합] {len(targets)}장", item.status))
+            self._select_item(item)
+            self.show_item(item)
+            self.status_var.set(f"결합 완료. 결과: {res.out_dir}")
+            notice = "\n".join(ln for ln in res.summary.splitlines() if any(k in ln for k in ("[주의]", "[실패]", "실패 이유")))
+            if notice:
+                self._notify("결합", "결합은 됐지만 확인할 점이 있습니다.\n\n" + notice)
+
+        self._start(f"결합 계산 중… ({len(targets)}장)", work, done, sync)
+
+    def _select_item(self, item: PhotoItem) -> None:
+        self._showing = True                              # 목록을 고르는 것만으로 그림을 또 열지 않게
+        try:
+            self.photo_tree.selection_set(item.iid)
+            self.photo_tree.see(item.iid)
+            self.update()                                 # '골랐다' 는 알림이 여기서 처리되고 지나가게 한다
+        finally:
+            self._showing = False
+
+    def show_log(self) -> None:
+        """마지막으로 실행한 프로그램이 찍은 글을 새 창에 보여 준다."""
+        win = tk.Toplevel(self)
+        win.title("실행 기록")
+        win.geometry("900x600")
+        text = tk.Text(win, wrap="none", font=("Consolas", 10))
+        bar = ttk.Scrollbar(win, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        text.insert("1.0", self.last_log or "아직 실행한 기록이 없습니다. '정사영' 이나 '결합' 을 누르면 여기에 남습니다.")
+        text.configure(state="disabled")
+
+    # ---------------------------------------------------------------- 결과 그림 열기
     def ask_open(self) -> None:
         start = self.mapper.image_path.parent if self.mapper else self.cfg.start_dir
         path = filedialog.askopenfilename(
-            parent=self, title="측정할 그림 선택",
+            parent=self, title="측정할 결과 그림 선택",
             initialdir=str(start) if Path(start).is_dir() else None,
             filetypes=[("그림", "*.png *.jpg *.jpeg"), ("모든 파일", "*.*")])
         if path:
             self.open_image(path)
 
+    def _set_image(self, image: Image.Image, mapper: coords.Mapper | None) -> None:
+        self.image, self.mapper = image, mapper
+        self.measurements.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.pending, self._next_no = None, 1
+        self.detail_var.set("")
+        self.update_idletasks()
+
     def open_image(self, path: str, ask_on_error: bool = True) -> bool:
-        """그림과 그 옆의 좌표 정보를 읽는다. 좌표 정보를 못 찾으면 열지 않는다 (축척을 추측하지 않는다)."""
+        """결과 그림과 그 옆의 좌표 정보를 읽는다. 좌표 정보를 못 찾으면 열지 않는다 (축척을 추측하지 않는다)."""
         p = Path(path)
         try:
             with Image.open(p) as im:
                 image = im.convert("RGB")
         except (OSError, ValueError) as e:
-            messagebox.showerror("그림 열기", f"그림을 읽지 못했습니다.\n{p.name}\n\n{e}", parent=self)
+            self._notify("그림 열기", f"그림을 읽지 못했습니다.\n{p.name}\n\n{e}", error=True)
             return False
         try:
             mapper = coords.find_mapper(p, image.size)
         except coords.CoordError as e:
-            if not ask_on_error:
+            if not ask_on_error or self.quiet:
+                self.last_message = str(e)
                 self.status_var.set(str(e).splitlines()[0])
                 return False
             if not messagebox.askyesno("좌표 정보", f"{e}\n\n좌표 정보 파일(JSON)을 직접 고르시겠습니까?", parent=self):
@@ -143,13 +514,9 @@ class MeasureApp(tk.Tk):
             try:
                 mapper = coords.read_mapper(Path(meta), p, image.size)
             except coords.CoordError as e2:
-                messagebox.showerror("좌표 정보", str(e2), parent=self)
+                self._notify("좌표 정보", str(e2), error=True)
                 return False
-        self.image, self.mapper = image, mapper
-        self.measurements.clear()
-        self.tree.delete(*self.tree.get_children())
-        self.pending, self._next_no = None, 1
-        self.detail_var.set("")
+        self._set_image(image, mapper)
         self.title(f"바닥판 치수 측정 - {p.parent.name}\\{p.name}")
         scale = "자리마다 다름 (마우스를 올리면 아래에 표시)" if mapper.kind == "photo" else f"{mapper.plane_from_pixel[0, 0]:.4g} mm/픽셀"
         self.info_var.set(f"파일: {p.parent.name}\\{p.name}\n종류: {mapper.kind_name}\n크기: {mapper.width} × {mapper.height} 픽셀\n"
@@ -159,7 +526,6 @@ class MeasureApp(tk.Tk):
             notes.append(f"'예상 오차' 는 마커 모서리를 {self.cfg.corner_noise_px:g} 픽셀 틀리게 읽었다고 가정한 값입니다. 실제 오차는 더 클 수 있습니다.")
         self.notes_var.set("\n".join(f"· {n}" for n in notes) or "-")
         self.status_var.set("그림을 열었습니다. 휠로 확대한 뒤 왼쪽 단추로 시작점과 끝점을 차례로 찍으세요.")
-        self.update_idletasks()
         self.fit()
         return True
 
@@ -208,7 +574,10 @@ class MeasureApp(tk.Tk):
 
     # ---------------------------------------------------------------- 점 찍기
     def _on_click(self, event) -> None:
+        if self.image is None:
+            return
         if self.mapper is None:
+            self.status_var.set("정사영 전의 사진이라 치수를 잴 수 없습니다. '정사영' 단추를 먼저 누르세요.")
             return
         p = self.view.to_image(event.x, event.y)
         if not self.mapper.inside(p):
@@ -223,6 +592,8 @@ class MeasureApp(tk.Tk):
 
     def add_measurement(self, a_px, b_px) -> Measurement | None:
         """두 픽셀 사이를 재서 목록에 넣는다. 계산할 수 없는 점이면 넣지 않고 이유를 아래에 표시한다."""
+        if self.mapper is None:
+            return None
         try:
             result = self.mapper.measure(a_px, b_px, self.cfg.corner_noise_px)
         except coords.CoordError as e:
@@ -290,7 +661,8 @@ class MeasureApp(tk.Tk):
         c.delete("all")
         w, h = self._view_size()
         if self.image is None:
-            c.create_text(w / 2, h / 2, text="'열기' 를 눌러 그림을 고르세요\n(orthorectified.png · aruco_detected.png · registered_mosaic.png)",
+            c.create_text(w / 2, h / 2, text="'사진 추가' 로 사진을 넣고 '정사영' 을 누르세요\n\n이미 만든 결과는 '결과 열기' 로 엽니다\n"
+                                             "(orthorectified.png · aruco_detected.png · registered_mosaic.png)",
                           fill="#bbbbbb", justify="center", font=("", 12))
             return
         box = self.view.visible_box(self.image.width, self.image.height, w, h)
@@ -347,7 +719,7 @@ class MeasureApp(tk.Tk):
 
     def _on_motion(self, event) -> None:
         self._set_cursor((event.x, event.y))
-        if self.mapper is None:
+        if self.mapper is None or self._busy:
             return
         p = self.view.to_image(event.x, event.y)
         if not self.mapper.inside(p):
