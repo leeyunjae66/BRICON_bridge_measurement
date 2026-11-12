@@ -1,10 +1,14 @@
 """
 측정 화면 (tkinter).
 
+  목록 (왼쪽의 탭)
+    탭 하나가 사진 묶음 하나다. 사진 추가·정사영·결합은 지금 보고 있는 탭의 목록에만 적용된다.
+    마커 크기와 결합 방식도 목록마다 따로 두고, 결과도 목록 이름의 폴더에 따로 저장한다.
+    목록 이름, 넣은 사진, 계산 결과는 session.json 에 기억해 두었다가 창을 다시 켜면 되살린다.
   사진을 넣고 계산 돌리기
-    사진 추가        : 스마트폰 사진을 왼쪽 목록에 넣는다 (여러 장 가능)
-    정사영           : 목록에서 고른 사진을 1단계 프로그램으로 정사영한다 (고른 것이 없으면 아직 안 한 사진 전부)
-    결합             : 정사영한 사진들을 2단계 프로그램으로 하나로 정합한다 (목록의 위에서부터, 첫 번째가 기준)
+    사진 추가        : 스마트폰 사진을 지금 목록에 넣는다 (여러 장 가능)
+    정사영           : 지금 목록에서 고른 사진을 1단계 프로그램으로 정사영한다 (고른 것이 없으면 아직 안 한 사진 전부)
+    결합             : 지금 목록의 정사영한 사진들을 2단계 프로그램으로 하나로 정합한다 (위에서부터, 첫 번째가 기준)
     결과 열기        : 이미 만들어 둔 결과 그림을 바로 연다
   그림에서 재기
     마우스 휠        : 마우스가 있는 자리를 중심으로 확대·축소
@@ -53,6 +57,17 @@ class PhotoItem:
     ortho: Path | None = None             # 정사영이 끝났으면 orthorectified.png
 
 
+@dataclass
+class PhotoList:
+    """탭 하나 = 사진 묶음 하나. 정사영·결합은 지금 보고 있는 탭의 사진에만 적용된다."""
+    name: str
+    marker_var: tk.StringVar              # 이 목록의 마커 한 변 (mm)
+    mode_var: tk.StringVar                # 이 목록의 결합 방식 (화면에 보이는 글)
+    frame: ttk.Frame
+    tree: ttk.Treeview
+    items: list[PhotoItem]
+
+
 def short_name(name: str, limit: int = 22) -> str:
     """긴 파일 이름은 가운데를 줄인다. 이름이 비슷한 사진은 끝부분이 다르므로 끝을 남긴다."""
     if len(name) <= limit:
@@ -72,7 +87,7 @@ class MeasureApp(tk.Tk):
         self.mapper: coords.Mapper | None = None
         self.view = Viewport()
         self.measurements: list[Measurement] = []
-        self.photos: list[PhotoItem] = []
+        self.lists: list[PhotoList] = []                      # 탭마다 하나
         self.pending: tuple[float, float] | None = None       # 찍어 둔 시작점 (그림 픽셀)
         self.cursor: tuple[float, float] | None = None        # 마우스 위치 (화면)
         self.quiet = False                                    # True 면 알림 창을 띄우지 않는다 (자동 시험용)
@@ -86,9 +101,11 @@ class MeasureApp(tk.Tk):
         self._fit_scale = 1.0
         self._busy = False
         self._showing = False
+        self._restoring = False
+        self._shown_iid: str | None = None                    # 지금 가운데에 떠 있는 목록 항목
         self._action_buttons: list[ttk.Button] = []
         self._build()
-        self._load_settings()
+        self._load_session()
         if image_path:
             self.after(80, lambda: self.open_image(image_path))
 
@@ -100,15 +117,18 @@ class MeasureApp(tk.Tk):
         self._button(work, "사진 추가", self.add_photos)
         self._button(work, "목록에서 빼기", self.remove_selected_photos)
         ttk.Separator(work, orient="vertical").pack(side="left", fill="y", padx=8)
+        # 마커 크기와 결합 방식은 목록마다 따로다. 탭을 바꾸면 그 목록의 값이 이 칸에 나타난다 (_on_list_change).
         ttk.Label(work, text="마커 한 변 (mm)").pack(side="left")
-        self.marker_var = tk.StringVar(value=f"{self.cfg.marker_size_mm:g}")
-        ttk.Entry(work, textvariable=self.marker_var, width=7, justify="right").pack(side="left", padx=(4, 4))
+        self.marker_entry = ttk.Entry(work, width=7, justify="right")
+        self.marker_entry.pack(side="left", padx=(4, 4))
         self._button(work, "정사영", self.orthorectify)
         ttk.Separator(work, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Label(work, text="결합 방식").pack(side="left")
-        self.mode_var = tk.StringVar(value=runner.MODES.get(self.cfg.registration_mode, runner.MODES["marker"]))
-        ttk.Combobox(work, textvariable=self.mode_var, values=list(runner.MODES.values()), state="readonly", width=24).pack(side="left", padx=(4, 4))
+        self.mode_box = ttk.Combobox(work, values=list(runner.MODES.values()), state="readonly", width=24)
+        self.mode_box.pack(side="left", padx=(4, 4))
         self._button(work, "결합", self.register)
+        self.scope_var = tk.StringVar(value="")
+        ttk.Label(work, textvariable=self.scope_var, foreground="#0a5c9c").pack(side="left", padx=(8, 0))
         ttk.Separator(work, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(work, text="실행 기록", command=self.show_log).pack(side="left", padx=2)
 
@@ -133,15 +153,16 @@ class MeasureApp(tk.Tk):
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
         ttk.Label(left, text="사진 목록", font=("", 10, "bold")).pack(anchor="w")
-        self.photo_tree = ttk.Treeview(left, columns=("name", "status"), show="headings", selectmode="extended")
-        self.photo_tree.heading("name", text="이름")
-        self.photo_tree.heading("status", text="상태")
-        self.photo_tree.column("name", width=self.cfg.photo_panel_width - 100, stretch=True)
-        self.photo_tree.column("status", width=80, anchor="center", stretch=False)
-        self.photo_tree.pack(fill="both", expand=True, pady=(2, 6))
-        self.photo_tree.bind("<<TreeviewSelect>>", lambda e: self._on_photo_select())
-        ttk.Label(left, text="사진을 누르면 가운데에 보입니다. 정사영이 끝난 사진은 펴진 그림이 보이고 치수를 잴 수 있습니다.\n"
-                             "결합은 위에서부터 순서대로, 첫 번째 사진이 기준입니다.",
+        tools = ttk.Frame(left)
+        tools.pack(fill="x", pady=(2, 4))
+        self._button(tools, "새 목록", self.new_list)
+        self._button(tools, "이름 바꾸기", self.ask_rename_list)
+        self._button(tools, "목록 지우기", self.delete_list)
+        self.book = ttk.Notebook(left)                    # 탭 하나가 목록 하나
+        self.book.pack(fill="both", expand=True, pady=(0, 6))
+        self.book.bind("<<NotebookTabChanged>>", lambda e: self._on_list_change())
+        ttk.Label(left, text="사진 추가·정사영·결합은 지금 보고 있는 탭의 목록에만 적용됩니다.\n"
+                             "사진을 누르면 가운데에 보입니다. 결합은 위에서부터 순서대로, 첫 번째 사진이 기준입니다.",
                   wraplength=self.cfg.photo_panel_width - 16, justify="left", foreground="#555555").pack(anchor="w")
 
         # 오른쪽: 그림 정보와 측정 목록
@@ -197,32 +218,124 @@ class MeasureApp(tk.Tk):
         if not self.quiet:
             (messagebox.showerror if error else messagebox.showinfo)(title, text, parent=self)
 
-    # ---------------------------------------------------------------- 설정 기억하기 (마커 크기, 결합 방식)
-    def _load_settings(self) -> None:
-        try:
-            with open(self.cfg.settings_file, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if float(d.get("marker_size_mm", 0)) > 0:
-                self.marker_var.set(f"{float(d['marker_size_mm']):g}")
-            if d.get("registration_mode") in runner.MODES:
-                self.mode_var.set(runner.MODES[d["registration_mode"]])
-        except (OSError, ValueError, TypeError):
-            pass
+    # ---------------------------------------------------------------- 목록 (탭)
+    @property
+    def current(self) -> PhotoList:
+        """지금 보고 있는 탭의 목록."""
+        return self.lists[self.book.index("current")]
 
-    def _save_settings(self) -> None:
-        try:
-            data = {"marker_size_mm": self.marker_size(), "registration_mode": self.mode()}
-            with open(self.cfg.settings_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except (OSError, ValueError):
-            pass
+    # 아래 네 가지는 '지금 목록' 의 것을 가리킨다 (목록이 하나뿐이던 때의 이름을 그대로 쓴다)
+    @property
+    def photos(self) -> list[PhotoItem]:
+        return self.current.items
 
-    def _on_close(self) -> None:
-        self._save_settings()
-        self.destroy()
+    @property
+    def photo_tree(self) -> ttk.Treeview:
+        return self.current.tree
+
+    @property
+    def marker_var(self) -> tk.StringVar:
+        return self.current.marker_var
+
+    @property
+    def mode_var(self) -> tk.StringVar:
+        return self.current.mode_var
+
+    def _free_name(self) -> str:
+        used = {lst.name for lst in self.lists}
+        n = 1
+        while f"목록 {n}" in used:
+            n += 1
+        return f"목록 {n}"
+
+    def new_list(self, name: str | None = None, marker: str | None = None, mode: str | None = None, select: bool = True) -> PhotoList:
+        """새 목록(탭)을 만든다. 마커 크기와 결합 방식은 지금 목록의 값을 물려받는다 (첫 목록은 설정의 처음 값)."""
+        if marker is None:
+            marker = self.current.marker_var.get() if self.lists else f"{self.cfg.marker_size_mm:g}"
+        if mode not in runner.MODES:
+            mode = self.mode() if self.lists else self.cfg.registration_mode
+        name = (name or "").strip()
+        if not name or name in {lst.name for lst in self.lists}:
+            name = self._free_name()
+        frame = ttk.Frame(self.book)
+        tree = ttk.Treeview(frame, columns=("name", "status"), show="headings", selectmode="extended")
+        tree.heading("name", text="이름")
+        tree.heading("status", text="상태")
+        tree.column("name", width=self.cfg.photo_panel_width - 110, stretch=True)
+        tree.column("status", width=80, anchor="center", stretch=False)
+        tree.pack(fill="both", expand=True)
+        tree.bind("<<TreeviewSelect>>", lambda e: self._on_photo_select())
+        lst = PhotoList(name, tk.StringVar(value=marker), tk.StringVar(value=runner.MODES.get(mode, runner.MODES["marker"])), frame, tree, [])
+        self.lists.append(lst)
+        self.book.add(frame, text=name)
+        if select:
+            self.book.select(frame)
+            self.update_idletasks()
+            self._on_list_change()
+            self._save_session()
+        return lst
+
+    def ask_rename_list(self) -> None:
+        from tkinter import simpledialog
+        name = simpledialog.askstring("이름 바꾸기", "목록의 새 이름:", initialvalue=self.current.name, parent=self)
+        if name is not None:
+            self.rename_list(name)
+
+    def rename_list(self, name: str) -> bool:
+        """지금 목록의 이름을 바꾼다. 이미 만든 결과는 예전 이름의 폴더에 그대로 있고, 새 결과부터 새 이름의 폴더에 저장된다."""
+        name = name.strip()
+        lst = self.current
+        if not name or name == lst.name:
+            return False
+        if name in {x.name for x in self.lists}:
+            self._notify("이름 바꾸기", f"'{name}' 이라는 목록이 이미 있습니다. 다른 이름을 쓰세요.", error=True)
+            return False
+        lst.name = name
+        self.book.tab(lst.frame, text=name)
+        self._on_list_change()
+        self._save_session()
+        return True
+
+    def delete_list(self) -> None:
+        """지금 목록을 화면에서 지운다. 사진과 계산 결과 파일은 지우지 않는다."""
+        lst = self.current
+        if lst.items and not self.quiet and not messagebox.askyesno(
+                "목록 지우기", f"'{lst.name}' 목록을 화면에서 지울까요?\n사진과 계산 결과 파일은 지워지지 않습니다.", parent=self):
+            return
+        self.lists.remove(lst)
+        self.book.forget(lst.frame)
+        lst.frame.destroy()
+        if not self.lists:
+            self.new_list(select=False)                   # 목록은 늘 하나 이상 있다
+        self.update_idletasks()
+        self._on_list_change()
+        self._save_session()
+
+    def _on_list_change(self) -> None:
+        """탭을 바꿨을 때: 입력 칸을 그 목록의 값으로 바꾸고, 그 목록의 그림을 가운데에 띄운다."""
+        if not self.lists:
+            return
+        lst = self.current
+        self.marker_entry.configure(textvariable=lst.marker_var)
+        self.mode_box.configure(textvariable=lst.mode_var)
+        self.scope_var.set(f"←  '{lst.name}' 에 적용")
+        if self._restoring or self._busy or self._showing:
+            return
+        sel = lst.tree.selection()
+        if len(sel) == 1:
+            if sel[0] != self._shown_iid:                 # 이미 떠 있는 그림을 또 읽지 않는다
+                self.show_item(self._item(sel[0]))
+        elif lst.items and not sel:
+            # 고른 사진이 없으면 결합 결과(있으면)나 첫 사진을 골라 보여 준다
+            item = next((it for it in lst.items if it.kind == "mosaic"), lst.items[0])
+            self._select_item(item)
+            self.show_item(item)
+
+    def _list_of(self, item: PhotoItem) -> PhotoList | None:
+        return next((lst for lst in self.lists if item in lst.items), None)
 
     def marker_size(self) -> float:
-        """입력 칸의 마커 크기. 숫자가 아니거나 0 이하면 ValueError."""
+        """지금 목록의 마커 크기. 숫자가 아니거나 0 이하면 ValueError."""
         value = float(self.marker_var.get().strip().replace(",", "."))
         if not value > 0:
             raise ValueError("0 보다 커야 합니다")
@@ -230,6 +343,62 @@ class MeasureApp(tk.Tk):
 
     def mode(self) -> str:
         return next((k for k, v in runner.MODES.items() if v == self.mode_var.get()), "marker")
+
+    # ---------------------------------------------------------------- 목록 기억하기 (창을 다시 켜면 되살린다)
+    def _save_session(self) -> None:
+        if self._restoring:
+            return
+        data = {"active": self.book.index("current") if self.lists else 0, "lists": []}
+        for lst in self.lists:
+            mode = next((k for k, v in runner.MODES.items() if v == lst.mode_var.get()), "marker")
+            photos = [{"path": str(it.path), "ortho": str(it.ortho) if it.ortho else None} for it in lst.items if it.kind == "photo"]
+            mosaic = next((str(it.path) for it in lst.items if it.kind == "mosaic"), None)
+            data["lists"].append({"name": lst.name, "marker_size_mm": lst.marker_var.get(), "registration_mode": mode,
+                                  "photos": photos, "mosaic": mosaic})
+        try:
+            with open(self.cfg.session_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _load_session(self) -> None:
+        """지난번에 쓰던 목록을 되살린다. 결과 파일이 그사이 없어졌으면 그 사진은 '원본' 으로 돌아간다."""
+        self._restoring = True
+        active = 0
+        try:
+            with open(self.cfg.session_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            active = int(data.get("active", 0))
+            for d in data.get("lists", []):
+                lst = self.new_list(str(d.get("name", "")), str(d.get("marker_size_mm", f"{self.cfg.marker_size_mm:g}")),
+                                    d.get("registration_mode"), select=False)
+                for ph in d.get("photos", []):
+                    item = PhotoItem(f"p{self._next_item}", "photo", Path(ph["path"]))
+                    self._next_item += 1
+                    ortho = Path(ph["ortho"]) if ph.get("ortho") else None
+                    if ortho is not None and ortho.is_file() and (ortho.parent / "homography.json").is_file():
+                        item.ortho, item.status = ortho, "정사영 완료"
+                    lst.items.append(item)
+                    lst.tree.insert("", "end", iid=item.iid, values=(short_name(item.path.name), item.status))
+                mosaic = Path(d["mosaic"]) if d.get("mosaic") else None
+                if mosaic is not None and mosaic.is_file() and (mosaic.parent / "registration.json").is_file():
+                    n = sum(1 for it in lst.items if it.ortho is not None)
+                    item = PhotoItem(f"m{self._next_item}", "mosaic", mosaic, "결합 완료")
+                    self._next_item += 1
+                    lst.items.append(item)
+                    lst.tree.insert("", "end", iid=item.iid, values=(f"[결합] {n}장", item.status))
+        except (OSError, ValueError, TypeError, KeyError):
+            pass                                          # 기억해 둔 것이 없거나 읽을 수 없으면 빈 목록으로 시작
+        if not self.lists:
+            self.new_list(select=False)
+        self.book.select(self.lists[min(max(active, 0), len(self.lists) - 1)].frame)
+        self.update_idletasks()
+        self._restoring = False
+        self.after(120, self._on_list_change)             # 창이 다 그려진 뒤에 그 목록의 그림을 띄운다
+
+    def _on_close(self) -> None:
+        self._save_session()
+        self.destroy()
 
     # ---------------------------------------------------------------- 사진 목록
     def add_photos(self, paths: list[str] | None = None) -> None:
@@ -239,7 +408,8 @@ class MeasureApp(tk.Tk):
                 parent=self, title="정사영할 사진 선택 (여러 장 가능)",
                 initialdir=str(start) if Path(start).is_dir() else None,
                 filetypes=[("사진", "*.jpg *.jpeg *.png *.heic *.heif"), ("모든 파일", "*.*")])
-        have = {it.path.resolve() for it in self.photos if it.kind == "photo"}
+        lst = self.current                                # 지금 보고 있는 탭의 목록에 넣는다
+        have = {it.path.resolve() for it in lst.items if it.kind == "photo"}
         first = None
         for p in paths or []:
             path = Path(p)
@@ -249,28 +419,32 @@ class MeasureApp(tk.Tk):
             item = PhotoItem(f"p{self._next_item}", "photo", path)
             self._next_item += 1
             # 결합 결과는 늘 목록 맨 아래에 두므로 사진은 그 앞에 넣는다
-            pos = sum(1 for it in self.photos if it.kind == "photo")
-            self.photos.insert(pos, item)
-            self.photo_tree.insert("", pos, iid=item.iid, values=(short_name(path.name), item.status))
+            pos = sum(1 for it in lst.items if it.kind == "photo")
+            lst.items.insert(pos, item)
+            lst.tree.insert("", pos, iid=item.iid, values=(short_name(path.name), item.status))
             first = first or item
         if first is not None:
-            self.photo_tree.selection_set(first.iid)
-            self.photo_tree.see(first.iid)
+            lst.tree.selection_set(first.iid)
+            lst.tree.see(first.iid)
+            self._save_session()
 
     def remove_selected_photos(self) -> None:
-        gone = set(self.photo_tree.selection())
+        lst = self.current
+        gone = set(lst.tree.selection())
         if not gone:
             return
-        self.photos = [it for it in self.photos if it.iid not in gone]
-        self.photo_tree.delete(*gone)
+        lst.items[:] = [it for it in lst.items if it.iid not in gone]
+        lst.tree.delete(*gone)
+        self._save_session()
 
     def _item(self, iid: str) -> PhotoItem | None:
-        return next((it for it in self.photos if it.iid == iid), None)
+        return next((it for lst in self.lists for it in lst.items if it.iid == iid), None)
 
     def _set_status(self, item: PhotoItem, status: str) -> None:
         item.status = status
-        if self.photo_tree.exists(item.iid):
-            self.photo_tree.set(item.iid, "status", status)
+        lst = self._list_of(item)
+        if lst is not None and lst.tree.exists(item.iid):
+            lst.tree.set(item.iid, "status", status)
 
     def _on_photo_select(self) -> None:
         if self._showing or self._busy:
@@ -283,6 +457,7 @@ class MeasureApp(tk.Tk):
         """목록의 사진을 가운데에 띄운다. 정사영이 끝났으면 펴진 그림(측정 가능), 아니면 원본 사진(보기만)."""
         if item is None:
             return
+        self._shown_iid = item.iid
         if item.kind == "mosaic":
             self.open_image(str(item.path), ask_on_error=False)
         elif item.ortho is not None:
@@ -321,7 +496,7 @@ class MeasureApp(tk.Tk):
         """
         if self._busy:
             return
-        self._save_settings()
+        self._save_session()
         self.status_var.set(title)
         if sync:
             done(work(self.status_var.set))
@@ -361,12 +536,13 @@ class MeasureApp(tk.Tk):
         self.after(100, poll)
 
     def orthorectify(self, sync: bool = False) -> None:
-        """고른 사진(없으면 아직 안 한 사진 전부)을 1단계 프로그램으로 정사영하고, 결과를 띄운다."""
-        photos = [it for it in self.photos if it.kind == "photo"]
+        """지금 목록에서 고른 사진(없으면 아직 안 한 사진 전부)을 1단계 프로그램으로 정사영하고, 결과를 띄운다."""
+        lst = self.current                                # 누른 순간의 목록. 계산 중에 탭을 바꿔도 이 목록에 적용된다
+        photos = [it for it in lst.items if it.kind == "photo"]
         if not photos:
-            self._notify("정사영", "먼저 '사진 추가' 로 사진을 넣으세요.")
+            self._notify("정사영", f"'{lst.name}' 목록에 사진이 없습니다. 먼저 '사진 추가' 로 사진을 넣으세요.")
             return
-        sel = set(self.photo_tree.selection())
+        sel = set(lst.tree.selection())
         targets = [it for it in photos if it.iid in sel] or [it for it in photos if it.ortho is None]
         if not targets:
             self._notify("정사영", "정사영할 사진이 없습니다. 다시 하려면 목록에서 사진을 고른 뒤 누르세요.")
@@ -378,13 +554,15 @@ class MeasureApp(tk.Tk):
             return
         for it in targets:
             self._set_status(it, "계산 중")
+        # 결과는 목록 이름의 폴더에 따로 저장한다: 1단계 output\<목록 이름>\<사진 이름>
+        out_root = runner.STAGE1_DIR / "output" / runner.safe_name(lst.name)
 
         def work(progress):
             out = []
             for k, it in enumerate(targets, 1):
-                progress(f"정사영 계산 중 ({k}/{len(targets)}): {it.path.name}  (마커 {size:g} mm)")
+                progress(f"[{lst.name}] 정사영 계산 중 ({k}/{len(targets)}): {it.path.name}  (마커 {size:g} mm)")
                 try:
-                    out.append((it, runner.run_orthorectification(it.path, size)))
+                    out.append((it, runner.run_orthorectification(it.path, size, out_dir=out_root / runner.safe_name(it.path.stem))))
                 except runner.RunnerError as e:
                     out.append((it, e))
             return out
@@ -405,56 +583,66 @@ class MeasureApp(tk.Tk):
                 it.ortho = None
                 self._set_status(it, "실패")
             self.last_log = "\n\n".join(logs)
+            self._save_session()
             if last_ok is not None:
                 self._select_item(last_ok)
                 self.show_item(last_ok)
-                self.status_var.set(f"정사영 {len(results) - len(failed)}장 완료. 결과: {last_ok.ortho.parent}")
+                self.status_var.set(f"[{lst.name}] 정사영 {len(results) - len(failed)}장 완료. 결과: {last_ok.ortho.parent.parent}")
             if failed:
                 self._notify("정사영", f"{len(failed)}장을 정사영하지 못했습니다.\n\n" + "\n\n".join(f"[{it.path.name}]\n{why}" for it, why in failed), error=True)
 
-        self._start(f"정사영 계산 중… ({len(targets)}장)", work, done, sync)
+        self._start(f"[{lst.name}] 정사영 계산 중… ({len(targets)}장)", work, done, sync)
 
     def register(self, sync: bool = False) -> None:
-        """정사영한 사진들을 2단계 프로그램으로 정합하고, 합친 그림을 띄운다."""
-        ready = [it for it in self.photos if it.kind == "photo" and it.ortho is not None]
-        sel = set(self.photo_tree.selection())
+        """지금 목록의 정사영한 사진들을 2단계 프로그램으로 정합하고, 합친 그림을 띄운다. 다른 목록의 사진은 쓰지 않는다."""
+        lst = self.current
+        ready = [it for it in lst.items if it.kind == "photo" and it.ortho is not None]
+        sel = set(lst.tree.selection())
         chosen = [it for it in ready if it.iid in sel]
         targets = chosen if len(chosen) >= 2 else ready
         if len(targets) < 2:
-            self._notify("결합", f"결합하려면 정사영한 사진이 2장 이상 필요합니다 (지금 {len(ready)}장).\n사진을 추가하고 '정사영' 을 먼저 누르세요.")
+            self._notify("결합", f"결합하려면 '{lst.name}' 목록에 정사영한 사진이 2장 이상 필요합니다 (지금 {len(ready)}장).\n"
+                                 "사진을 추가하고 '정사영' 을 먼저 누르세요.")
             return
         mode = self.mode()
+        name = f"gui_{runner.safe_name(lst.name)}_{len(targets)}img_{mode}"      # 2단계 output 아래의 폴더 이름
 
         def work(progress):
-            progress(f"결합 계산 중… ({len(targets)}장, {runner.MODES[mode]})")
-            return runner.run_registration([it.ortho for it in targets], mode)
+            progress(f"[{lst.name}] 결합 계산 중… ({len(targets)}장, {runner.MODES[mode]})")
+            return runner.run_registration([it.ortho for it in targets], mode, name=name)
 
         def done(res: runner.RunResult):
-            self.last_log = f"===== 결합: {len(targets)}장, {runner.MODES[mode]}\n{res.output}"
+            self.last_log = f"===== 결합: {lst.name}, {len(targets)}장, {runner.MODES[mode]}\n{res.output}"
             if not res.ok:
                 self._notify("결합", f"결합하지 못했습니다.\n\n{res.summary}", error=True)
                 return
-            for it in [x for x in self.photos if x.kind == "mosaic"]:       # 결합 결과는 하나만 둔다
-                self.photos.remove(it)
-                self.photo_tree.delete(it.iid)
+            for it in [x for x in lst.items if x.kind == "mosaic"]:         # 결합 결과는 목록마다 하나만 둔다
+                lst.items.remove(it)
+                lst.tree.delete(it.iid)
             item = PhotoItem(f"m{self._next_item}", "mosaic", res.result_image, "결합 완료")
             self._next_item += 1
-            self.photos.append(item)
-            self.photo_tree.insert("", "end", iid=item.iid, values=(f"[결합] {len(targets)}장", item.status))
+            lst.items.append(item)
+            lst.tree.insert("", "end", iid=item.iid, values=(f"[결합] {len(targets)}장", item.status))
+            self._save_session()
             self._select_item(item)
             self.show_item(item)
-            self.status_var.set(f"결합 완료. 결과: {res.out_dir}")
+            self.status_var.set(f"[{lst.name}] 결합 완료. 결과: {res.out_dir}")
             notice = "\n".join(ln for ln in res.summary.splitlines() if any(k in ln for k in ("[주의]", "[실패]", "실패 이유")))
             if notice:
                 self._notify("결합", "결합은 됐지만 확인할 점이 있습니다.\n\n" + notice)
 
-        self._start(f"결합 계산 중… ({len(targets)}장)", work, done, sync)
+        self._start(f"[{lst.name}] 결합 계산 중… ({len(targets)}장)", work, done, sync)
 
     def _select_item(self, item: PhotoItem) -> None:
-        self._showing = True                              # 목록을 고르는 것만으로 그림을 또 열지 않게
+        """그 사진이 든 탭을 앞으로 내고 목록에서 고른다."""
+        lst = self._list_of(item)
+        if lst is None:
+            return
+        self._showing = True                              # 탭을 바꾸거나 목록을 고르는 것만으로 그림을 또 열지 않게
         try:
-            self.photo_tree.selection_set(item.iid)
-            self.photo_tree.see(item.iid)
+            self.book.select(lst.frame)
+            lst.tree.selection_set(item.iid)
+            lst.tree.see(item.iid)
             self.update()                                 # '골랐다' 는 알림이 여기서 처리되고 지나가게 한다
         finally:
             self._showing = False
@@ -480,6 +668,7 @@ class MeasureApp(tk.Tk):
             initialdir=str(start) if Path(start).is_dir() else None,
             filetypes=[("그림", "*.png *.jpg *.jpeg"), ("모든 파일", "*.*")])
         if path:
+            self._shown_iid = None                        # 목록의 사진이 아니라 따로 연 그림
             self.open_image(path)
 
     def _set_image(self, image: Image.Image, mapper: coords.Mapper | None) -> None:
