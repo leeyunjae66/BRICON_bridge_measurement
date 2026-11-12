@@ -1,0 +1,8 @@
+# RealSense 촬영·깊이 확인에 필요한 패키지 (Python 3.12 에서 확인)
+#   py -3 -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+# pyrealsense2 가 RealSense SDK 를 포함하므로 Intel 설치 프로그램은 따로 필요 없다.
+pyrealsense2>=2.56
+numpy>=1.24
+opencv-python>=4.7
+pillow>=10.0
