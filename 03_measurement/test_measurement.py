@@ -201,13 +201,16 @@ class View(unittest.TestCase):
 
 class Gui(unittest.TestCase):
     def setUp(self):
-        try:
-            from viewer import MeasureApp
-            self.app = MeasureApp()
-        except tk.TclError as e:
-            self.skipTest(f"화면을 쓸 수 없는 환경: {e}")
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
+        try:
+            from config import Config
+            from viewer import MeasureApp
+            self.app = MeasureApp(Config(session_file=self.dir / "session.json"))     # 실제 작업 내용을 건드리지 않게
+        except tk.TclError as e:
+            self.tmp.cleanup()
+            self.skipTest(f"화면을 쓸 수 없는 환경: {e}")
+        self.app.quiet = True
         stage1_folder(self.dir)
         self.app.geometry("1200x800+40+40")
         self.app.update()
